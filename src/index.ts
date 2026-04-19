@@ -6,7 +6,8 @@
  * shape (`{contents:[{role,parts:[{text}]}]}`), NOT the OpenAI-compat
  * surface. Auth is an API key passed as a URL query parameter.
  *
- * v0.0.1: single-turn + conversation-history resume. Tool calling TBD.
+ * v0.7: full model listing (queries /v1beta/models at boot) +
+ * Gemini-native tool / function calling with a 10-iteration cap.
  */
 
 import type {
@@ -20,7 +21,8 @@ import {
   DEFAULT_MODEL,
   DEFAULT_PROMPT_TEMPLATE,
   DEFAULT_TIMEOUT_SEC,
-  FREE_MODELS,
+  FALLBACK_MODELS,
+  type GeminiModelMeta,
 } from "./shared/constants.js";
 import {
   detectModel,
@@ -28,13 +30,32 @@ import {
   sessionCodec,
   testEnvironment,
 } from "./server/index.js";
+import { loadModels } from "./server/load-models.js";
 
 export const type = ADAPTER_TYPE;
 export const label = ADAPTER_LABEL;
 
-export const models: AdapterModel[] = FREE_MODELS.map((id) => ({
-  id,
-  label: `${id} (free tier)`,
+/**
+ * Discover models at boot. Falls back to FALLBACK_MODELS if the call
+ * fails (no API key at load time, network down, etc.).
+ */
+const discoveredModels: GeminiModelMeta[] = await (async () => {
+  try {
+    return await loadModels();
+  } catch {
+    return FALLBACK_MODELS;
+  }
+})();
+
+export const models: AdapterModel[] = discoveredModels.map((m) => ({
+  id: m.id,
+  label: m.label,
+  // Extra metadata is not part of AdapterModel yet; attached loosely so
+  // Paperclip UIs that introspect the object can surface it.
+  ...({ contextWindow: m.contextWindow, supportsThinking: m.supportsThinking } as Record<
+    string,
+    unknown
+  >),
 }));
 
 export const agentConfigurationDoc = `# Google Gemini Adapter
@@ -59,18 +80,29 @@ free-tier quota without any wrapper.
 | promptTemplate | string | _(default)_ | Mustache-style template. |
 | env | object | \`{}\` | Extra env vars. \`GEMINI_API_KEY\` here takes precedence over process env. |
 
-## Free Models
+## Models
 
-${FREE_MODELS.map((m) => `- \`${m}\``).join("\n")}
+Models are discovered at boot from \`GET /v1beta/models\`. Current list
+(this boot): ${discoveredModels.length} model(s).
+
+${discoveredModels.map((m) => `- \`${m.id}\` (ctx ${m.contextWindow}${m.supportsThinking ? ", thinking" : ""})`).join("\n")}
+
+## Tool Calling
+
+If the host wires a tools client onto the execution context (or declares
+tools inline under \`config.tools\` / \`context.tools\`), the adapter
+translates them to Gemini's \`functionDeclarations\` format and loops
+(max 10 iterations) on \`functionCall\` parts, executing them via
+\`ctx.tools.invoke(name, args)\`.
 
 ## Notes
 
 - Gemini has no native server-side sessions; this adapter persists the
   conversation history in \`sessionParams.history\` and replays it on
-  every call.
-- Tool / function calling is not yet implemented. (TODO)
+  every call. The history now also carries \`functionCall\` and
+  \`functionResponse\` parts so tool state survives resumes.
 - Streaming is buffered; tokens are flushed to the runner in one chunk
-  after the HTTP response completes. Incremental streaming is on the
+  after each HTTP response completes. Incremental streaming is on the
   roadmap.
 `;
 
@@ -82,7 +114,7 @@ const configSchema: AdapterConfigSchema = {
       type: "select",
       default: DEFAULT_MODEL,
       required: false,
-      options: FREE_MODELS.map((m) => ({ label: m, value: m })),
+      options: discoveredModels.map((m) => ({ label: m.label, value: m.id })),
     },
     {
       key: "timeoutSec",

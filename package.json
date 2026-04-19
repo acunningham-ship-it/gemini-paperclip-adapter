@@ -1,13 +1,13 @@
 {
-  "name": "gemini-paperclip-adapter",
-  "version": "0.0.1",
+  "name": "gemini-direct-paperclip-adapter",
+  "version": "0.0.7",
   "description": "Paperclip adapter for Google Gemini API direct. Free tier with generous daily quota. No Hermes wrapper bugs.",
   "type": "module",
   "license": "MIT",
   "author": "Armani Cunningham",
   "repository": {
     "type": "git",
-    "url": "https://github.com/acunningham-ship-it/gemini-paperclip-adapter"
+    "url": "https://github.com/acunningham-ship-it/gemini-direct-paperclip-adapter"
   },
   "keywords": ["paperclip", "gemini", "ai-agent", "adapter", "free-llm"],
   "exports": {
@@ -42,7 +42,7 @@
   },
   "engines": { "node": ">=20.0.0" },
   "paperclip": {
-    "adapterType": "gemini_local",
+    "adapterType": "gemini_direct_local",
     "adapterUiParser": "1"
   }
 }

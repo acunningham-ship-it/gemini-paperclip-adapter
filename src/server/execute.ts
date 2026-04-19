@@ -7,20 +7,25 @@
  * session params on every call, then append the newly-rendered user
  * prompt.
  *
+ * v0.7: added Gemini-native tool / function calling. If the host
+ * exposes a tools client on AdapterExecutionContext (or declares tools
+ * inline under config/context), we translate them to
+ * `tools: [{functionDeclarations: [...]}]` on the request, loop on
+ * `functionCall` parts in the response (max MAX_TOOL_ITERATIONS),
+ * invoke via `ctx.tools.invoke`, and feed the results back as a
+ * `function`-role turn.
+ *
  * Key Gemini quirks:
  *   - Auth is a `?key=` URL param, NOT a Bearer header.
  *   - Request shape is `{ contents: [{ role, parts: [{text}] }] }`, not
  *     OpenAI-style `messages`.
- *   - Roles are `user` and `model` (no `assistant`, no `system` — system
- *     instructions go in a top-level `systemInstruction` field).
+ *   - Roles are `user`, `model`, and `function` (no `assistant`, no
+ *     `system` — system instructions go in a top-level
+ *     `systemInstruction` field).
+ *   - Tool-call parts are `{ functionCall: { name, args } }`, NOT
+ *     OpenAI's `tool_calls[].function`.
  *   - Streaming body is a JSON array of GenerateContentResponse chunks,
  *     not SSE with `data:` prefix.
- *
- * TODO(gemini):
- *   - Tool / function calling passthrough
- *   - True incremental streaming into onLog (currently we buffer)
- *   - Safety-setting pass-through
- *   - Automatic retry on 429 with Retry-After
  */
 
 import {
@@ -40,12 +45,21 @@ import {
   DEFAULT_PROMPT_TEMPLATE,
   DEFAULT_TIMEOUT_SEC,
   GEMINI_BASE_URL,
+  MAX_TOOL_ITERATIONS,
   PROVIDER_SLUG,
 } from "../shared/constants.js";
 import {
   parseGeminiResponse,
   type GeminiContent,
+  type GeminiPart,
 } from "./parse.js";
+import {
+  readInlineToolDecls,
+  readToolsClient,
+  toFunctionResponsePayload,
+  toGeminiFunctionDeclarations,
+  type PaperclipToolDecl,
+} from "./tools.js";
 
 function resolveApiKey(envConfig: Record<string, unknown>): string | null {
   const fromConfig =
@@ -67,14 +81,47 @@ function sanitizeHistoryFromSession(raw: unknown): GeminiContent[] {
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue;
     const rec = entry as Record<string, unknown>;
-    const role = rec.role === "model" ? "model" : rec.role === "user" ? "user" : null;
+    const role =
+      rec.role === "model"
+        ? "model"
+        : rec.role === "user"
+          ? "user"
+          : rec.role === "function"
+            ? "function"
+            : null;
     if (!role) continue;
     const partsRaw = Array.isArray(rec.parts) ? rec.parts : [];
-    const parts: { text: string }[] = [];
+    const parts: GeminiPart[] = [];
     for (const p of partsRaw) {
       if (!p || typeof p !== "object") continue;
-      const text = (p as Record<string, unknown>).text;
-      if (typeof text === "string") parts.push({ text });
+      const pr = p as Record<string, unknown>;
+      if (typeof pr.text === "string") {
+        parts.push({ text: pr.text });
+      } else if (pr.functionCall && typeof pr.functionCall === "object") {
+        const fc = pr.functionCall as Record<string, unknown>;
+        if (typeof fc.name === "string") {
+          parts.push({
+            functionCall: {
+              name: fc.name,
+              args: (fc.args && typeof fc.args === "object"
+                ? (fc.args as Record<string, unknown>)
+                : {}) as Record<string, unknown>,
+            },
+          });
+        }
+      } else if (pr.functionResponse && typeof pr.functionResponse === "object") {
+        const fr = pr.functionResponse as Record<string, unknown>;
+        if (typeof fr.name === "string") {
+          parts.push({
+            functionResponse: {
+              name: fr.name,
+              response: (fr.response && typeof fr.response === "object"
+                ? (fr.response as Record<string, unknown>)
+                : {}) as Record<string, unknown>,
+            },
+          });
+        }
+      }
     }
     if (parts.length > 0) out.push({ role, parts });
   }
@@ -108,6 +155,25 @@ export async function execute(
     };
   }
 
+  // Resolve tools (optional). The SDK does not statically expose
+  // `ctx.tools`; we read it structurally and fall back to inline
+  // declarations on config/context.
+  const toolsClient = readToolsClient(ctx);
+  const inlineDecls = readInlineToolDecls(ctx);
+  const toolDecls: PaperclipToolDecl[] = [];
+  if (toolsClient?.list) {
+    try {
+      const listed = await toolsClient.list();
+      if (Array.isArray(listed)) toolDecls.push(...listed);
+    } catch (err) {
+      await onLog(
+        "stderr",
+        `[gemini] tools.list failed: ${(err as Error).message}\n`,
+      );
+    }
+  }
+  toolDecls.push(...inlineDecls);
+
   // Render the user-facing prompt from the template.
   const templateData = {
     agentId: agent.id,
@@ -124,21 +190,25 @@ export async function execute(
   const sessionParams = parseObject(runtime.sessionParams);
   const sessionId =
     asString(sessionParams.sessionId, runtime.sessionId ?? "") || `gemini-${runId}`;
-  const history = sanitizeHistoryFromSession(sessionParams.history);
+  const initialHistory = sanitizeHistoryFromSession(sessionParams.history);
   const contents: GeminiContent[] = [
-    ...history,
+    ...initialHistory,
     { role: "user", parts: [{ text: renderedPrompt || " " }] },
   ];
 
-  const requestBody: Record<string, unknown> = { contents };
+  const baseRequest: Record<string, unknown> = {};
   if (systemInstruction) {
-    requestBody.systemInstruction = { parts: [{ text: systemInstruction }] };
+    baseRequest.systemInstruction = { parts: [{ text: systemInstruction }] };
+  }
+  if (toolDecls.length > 0) {
+    baseRequest.tools = [
+      { functionDeclarations: toGeminiFunctionDeclarations(toolDecls) },
+    ];
   }
 
   const url =
     `${GEMINI_BASE_URL}/models/${encodeURIComponent(model)}:streamGenerateContent` +
     `?key=${encodeURIComponent(apiKey)}`;
-  // URL used in logs with the api key redacted.
   const loggedUrl =
     `${GEMINI_BASE_URL}/models/${encodeURIComponent(model)}:streamGenerateContent?key=REDACTED`;
 
@@ -149,29 +219,135 @@ export async function execute(
       commandArgs: ["POST", loggedUrl],
       commandNotes: [
         `Gemini native API (no OpenAI compat).`,
-        `Resumed history entries: ${history.length}`,
+        `Resumed history entries: ${initialHistory.length}`,
+        `Tools declared: ${toolDecls.length}`,
       ],
       prompt: renderedPrompt,
       promptMetrics: {
         promptChars: renderedPrompt.length,
-        historyEntries: history.length,
+        historyEntries: initialHistory.length,
+        toolCount: toolDecls.length,
       },
       context,
     });
   }
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutSec * 1000);
-  let resp: Response;
+  const overallTimer = setTimeout(() => controller.abort(), timeoutSec * 1000);
+
+  let accumulatedText = "";
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let lastModel: string | null = null;
+  let lastRaw: unknown = null;
+  let iterations = 0;
+  let hitIterationCap = false;
+
   try {
-    resp = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
-    });
+    // Tool-calling loop. Each iteration is one streamGenerateContent
+    // round-trip; we append modelParts + (optional) function-role
+    // results, then loop if the model asked for more tool calls. Caps
+    // at MAX_TOOL_ITERATIONS to avoid runaway tool storms.
+    while (true) {
+      iterations += 1;
+      const requestBody = { ...baseRequest, contents };
+
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+
+      const bodyText = await resp.text().catch(() => "");
+      if (!resp.ok) {
+        const snippet = bodyText.slice(0, 500);
+        await onLog("stderr", `[gemini] HTTP ${resp.status}: ${snippet}\n`);
+        clearTimeout(overallTimer);
+        const isAuth = resp.status === 401 || resp.status === 403;
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Gemini HTTP ${resp.status}: ${snippet}`,
+          errorCode: isAuth ? "gemini_auth_failed" : `gemini_http_${resp.status}`,
+          provider: PROVIDER_SLUG,
+          biller: BILLER_SLUG,
+          model,
+          billingType: "api",
+          resultJson: { status: resp.status, body: bodyText },
+        };
+      }
+
+      const parsed = parseGeminiResponse(bodyText);
+      lastRaw = parsed.raw;
+      if (parsed.text) {
+        await onLog("stdout", parsed.text);
+        accumulatedText += parsed.text;
+      }
+      totalInputTokens += parsed.inputTokens;
+      totalOutputTokens += parsed.outputTokens;
+      if (parsed.model) lastModel = parsed.model;
+
+      // Append the assistant turn (including functionCall parts) to
+      // contents so Gemini sees its own prior tool-call on the next
+      // round — this is required by the Gemini spec.
+      if (parsed.modelParts.length > 0) {
+        contents.push({ role: "model", parts: parsed.modelParts });
+      }
+
+      // Terminate if no tool calls in this turn.
+      if (parsed.functionCalls.length === 0) break;
+
+      // Iteration cap — stop before invoking another round.
+      if (iterations >= MAX_TOOL_ITERATIONS) {
+        hitIterationCap = true;
+        await onLog(
+          "stderr",
+          `[gemini] hit tool-iteration cap (${MAX_TOOL_ITERATIONS}); stopping.\n`,
+        );
+        break;
+      }
+
+      if (!toolsClient) {
+        await onLog(
+          "stderr",
+          `[gemini] model requested ${parsed.functionCalls.length} tool call(s) ` +
+            `but no tools client is available; stopping.\n`,
+        );
+        break;
+      }
+
+      // Dispatch each functionCall and collect function-role parts.
+      const fnParts: GeminiPart[] = [];
+      for (const call of parsed.functionCalls) {
+        await onLog(
+          "stdout",
+          `\n[gemini] tool_call: ${call.name} ${JSON.stringify(call.args)}\n`,
+        );
+        let result: unknown;
+        try {
+          result = await toolsClient.invoke(call.name, call.args);
+        } catch (err) {
+          result = { error: (err as Error).message ?? String(err) };
+          await onLog(
+            "stderr",
+            `[gemini] tool ${call.name} threw: ${(err as Error).message}\n`,
+          );
+        }
+        fnParts.push({
+          functionResponse: {
+            name: call.name,
+            response: toFunctionResponsePayload(result),
+          },
+        });
+      }
+      contents.push({ role: "function", parts: fnParts });
+      // Loop: next request includes the function responses, and Gemini
+      // will either emit more tool calls or a final text answer.
+    }
   } catch (err) {
-    clearTimeout(timer);
+    clearTimeout(overallTimer);
     const aborted = (err as Error).name === "AbortError";
     const message = err instanceof Error ? err.message : String(err);
     await onLog("stderr", `[gemini] request failed: ${message}\n`);
@@ -187,38 +363,11 @@ export async function execute(
       billingType: "api",
     };
   }
+  clearTimeout(overallTimer);
 
-  const bodyText = await resp.text().catch(() => "");
-  clearTimeout(timer);
-
-  if (!resp.ok) {
-    const snippet = bodyText.slice(0, 500);
-    await onLog("stderr", `[gemini] HTTP ${resp.status}: ${snippet}\n`);
-    const isAuth = resp.status === 401 || resp.status === 403;
-    return {
-      exitCode: 1,
-      signal: null,
-      timedOut: false,
-      errorMessage: `Gemini HTTP ${resp.status}: ${snippet}`,
-      errorCode: isAuth ? "gemini_auth_failed" : `gemini_http_${resp.status}`,
-      provider: PROVIDER_SLUG,
-      biller: BILLER_SLUG,
-      model,
-      billingType: "api",
-      resultJson: { status: resp.status, body: bodyText },
-    };
-  }
-
-  const parsed = parseGeminiResponse(bodyText);
-  await onLog("stdout", parsed.text);
-
-  const updatedHistory: GeminiContent[] = [
-    ...history,
-    { role: "user", parts: [{ text: renderedPrompt || " " }] },
-    ...(parsed.text.length > 0
-      ? [{ role: "model" as const, parts: [{ text: parsed.text }] }]
-      : []),
-  ];
+  // Build updated history for session persistence: everything in
+  // `contents` past the initial resumed history.
+  const updatedHistory: GeminiContent[] = contents;
 
   return {
     exitCode: 0,
@@ -226,8 +375,8 @@ export async function execute(
     timedOut: false,
     errorMessage: null,
     usage: {
-      inputTokens: parsed.inputTokens,
-      outputTokens: parsed.outputTokens,
+      inputTokens: totalInputTokens,
+      outputTokens: totalOutputTokens,
     },
     sessionId,
     sessionParams: {
@@ -237,11 +386,14 @@ export async function execute(
     sessionDisplayId: sessionId,
     provider: PROVIDER_SLUG,
     biller: BILLER_SLUG,
-    model: parsed.model ?? model,
+    model: lastModel ?? model,
     billingType: "api",
     costUsd: null,
-    resultJson: parsed.raw as Record<string, unknown> | null,
-    summary: parsed.text,
+    resultJson: (lastRaw as Record<string, unknown> | null) ?? null,
+    summary: accumulatedText,
     clearSession: false,
+    errorMeta: hitIterationCap
+      ? { toolIterationCapHit: true, maxToolIterations: MAX_TOOL_ITERATIONS }
+      : undefined,
   };
 }
